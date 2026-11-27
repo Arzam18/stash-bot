@@ -90,18 +90,33 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Clang may define __ANDROID_API__ as the alias
+          # __ANDROID_MIN_SDK_VERSION__ in -dM output. Test its expanded value
+          # with a preprocessor expression instead of matching its raw text.
           ANDROID_MACROS="$(printf '\n' | "$ANDROID_CC" -dM -E -x c -)"
           grep -q '^#define __ANDROID__ 1$' <<< "$ANDROID_MACROS"
-          grep -q '^#define __ANDROID_API__ 24$' <<< "$ANDROID_MACROS"
+          grep -q '^#define __ANDROID_API__ ' <<< "$ANDROID_MACROS"
+          printf '%s\n' \
+            '#if !defined(__ANDROID_API__)' \
+            '#error __ANDROID_API__ is not defined' \
+            '#endif' \
+            '#if __ANDROID_API__ != 24' \
+            '#error Android API level is not 24' \
+            '#endif' | "$ANDROID_CC" -E -x c - >/dev/null
 
-          NEON_MACROS="$(printf '\n' | "$ANDROID_CC" -march=armv8-a+simd -dM -E -x c -)"
-          grep -q '^#define __aarch64__ 1$' <<< "$NEON_MACROS"
-          grep -q '^#define __ARM_NEON 1$' <<< "$NEON_MACROS"
+          # Validate ISA macros using preprocessor conditions so aliases or
+          # alternate macro formatting do not cause false negatives.
+          printf '%s\n' \
+            '#if !defined(__aarch64__) || !defined(__ARM_NEON)' \
+            '#error AArch64 NEON is unavailable' \
+            '#endif' | "$ANDROID_CC" -march=armv8-a+simd -E -x c - >/dev/null
 
-          DOTPROD_MACROS="$(printf '\n' | "$ANDROID_CC" -march=armv8.2-a+dotprod -dM -E -x c -)"
-          grep -q '^#define __aarch64__ 1$' <<< "$DOTPROD_MACROS"
-          grep -q '^#define __ARM_NEON 1$' <<< "$DOTPROD_MACROS"
-          grep -q '^#define __ARM_FEATURE_DOTPROD 1$' <<< "$DOTPROD_MACROS"
+          printf '%s\n' \
+            '#if !defined(__aarch64__) || !defined(__ARM_NEON) || !defined(__ARM_FEATURE_DOTPROD)' \
+            '#error AArch64 NEON + DotProd is unavailable' \
+            '#endif' | "$ANDROID_CC" -march=armv8.2-a+dotprod -E -x c - >/dev/null
+
+          echo "Compiler target verified: Android API 24, AArch64 NEON, and ARMv8.2 DotProd."
 
       - name: Build standard ARM64 NEON
         id: build_neon
