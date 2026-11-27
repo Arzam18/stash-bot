@@ -83,3 +83,21 @@ Stash supports for now all these UCI options:
         Zen-based AMD processors which are not Zen 3 or newer, as the `pext`
         microcode implementation will make the bmi2 binary slower than the
         popcnt one.
+
+## Android ARM64 builds
+
+The GitHub Actions workflow at `.github/workflows/android.yml` builds Android
+ARM64 executables with the Android NDK r27c (API 24):
+
+- `arm64-neon`: ARMv8-A + NEON. The bitboard population-count helper uses the
+  AArch64 NEON `CNT` and `ADDV` instructions.
+- `arm64-dotprod`: ARMv8.2-A with the DotProd extension enabled, while retaining
+  the same NEON bitboard-popcount implementation.
+
+Stash's current search and evaluation code has no integer dot-product kernel,
+so the DotProd build is not expected to contain or execute `SDOT` instructions.
+Both variants remain 64-bit Android PIE executables and are built with 16 KiB
+ELF segment alignment. The Android API 24 allocator path uses `posix_memalign`
+instead of `aligned_alloc` (which Bionic only provides from API 28). The
+workflow's `uci_date` input is included in the UCI engine version and build
+metadata.
