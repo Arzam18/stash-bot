@@ -1,0 +1,260 @@
+name: Stash Android ARM64 (NEON + DotProd)
+
+on:
+  workflow_dispatch:
+    inputs:
+      uci_date:
+        description: "Engine UCI build date in YYYYMMDD format"
+        required: true
+        type: string
+        default: "20261127"
+
+permissions:
+  contents: read
+
+jobs:
+  build-android-arm64:
+    name: Build Android ARM64 variants
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Android NDK r27c
+        id: setup_ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Export NDK path
+        shell: bash
+        env:
+          NDK_PATH: ${{ steps.setup_ndk.outputs['ndk-path'] }}
+        run: |
+          set -euo pipefail
+          test -n "$NDK_PATH"
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
+
+      - name: Validate build inputs and toolchain
+        id: build_meta
+        shell: bash
+        env:
+          UCI_DATE: ${{ inputs.uci_date }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$UCI_DATE" =~ ^[0-9]{8}$ ]]; then
+            echo "uci_date must contain exactly eight digits in YYYYMMDD format." >&2
+            exit 1
+          fi
+          python3 - "$UCI_DATE" <<'PY'
+          from datetime import datetime
+          import sys
+          try:
+              datetime.strptime(sys.argv[1], "%Y%m%d")
+          except ValueError as exc:
+              raise SystemExit(f"Invalid uci_date: {exc}")
+          PY
+
+          NDK_ROOT="$ANDROID_NDK_HOME"
+          TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC="$TOOLCHAIN/aarch64-linux-android24-clang"
+          for tool in "$CC" "$TOOLCHAIN/llvm-readelf" "$TOOLCHAIN/llvm-objdump" "$TOOLCHAIN/llvm-strip"; do
+            test -x "$tool" || { echo "Missing Android tool: $tool" >&2; exit 1; }
+          done
+
+          NDK_REVISION="$(sed -n 's/^Pkg.Revision = //p' "$NDK_ROOT/source.properties")"
+          test "$NDK_REVISION" = "27.2.12479018" || {
+            echo "Expected NDK r27c (27.2.12479018), found '$NDK_REVISION'." >&2
+            exit 1
+          }
+
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+          {
+            echo "ANDROID_TOOLCHAIN=$TOOLCHAIN"
+            echo "ANDROID_CC=$CC"
+            echo "UCI_DATE=$UCI_DATE"
+            echo "SOURCE_SHA=$SHORT_SHA"
+            echo "NDK_REVISION=$NDK_REVISION"
+          } >> "$GITHUB_ENV"
+
+          echo "Validated uci_date=$UCI_DATE, source=$SHORT_SHA, NDK=$NDK_REVISION"
+
+      - name: Verify ARM compiler feature macros
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ANDROID_MACROS="$(printf '\n' | "$ANDROID_CC" -dM -E -x c -)"
+          grep -q '^#define __ANDROID__ 1$' <<< "$ANDROID_MACROS"
+          grep -q '^#define __ANDROID_API__ 24$' <<< "$ANDROID_MACROS"
+
+          NEON_MACROS="$(printf '\n' | "$ANDROID_CC" -march=armv8-a+simd -dM -E -x c -)"
+          grep -q '^#define __aarch64__ 1$' <<< "$NEON_MACROS"
+          grep -q '^#define __ARM_NEON 1$' <<< "$NEON_MACROS"
+
+          DOTPROD_MACROS="$(printf '\n' | "$ANDROID_CC" -march=armv8.2-a+dotprod -dM -E -x c -)"
+          grep -q '^#define __aarch64__ 1$' <<< "$DOTPROD_MACROS"
+          grep -q '^#define __ARM_NEON 1$' <<< "$DOTPROD_MACROS"
+          grep -q '^#define __ARM_FEATURE_DOTPROD 1$' <<< "$DOTPROD_MACROS"
+
+      - name: Build standard ARM64 NEON
+        id: build_neon
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          make -C src clean
+
+          ENGINE_VERSION="v37.31-${UCI_DATE}-${SOURCE_SHA}-android-arm64-neon"
+          make -C src -j2 all \
+            CC="$ANDROID_CC" \
+            ARCH=arm64-neon \
+            NATIVE=no \
+            ANDROID=yes \
+            ENGINE_VERSION="$ENGINE_VERSION" \
+            EXE="$GITHUB_WORKSPACE/dist/stash-android-arm64-neon" \
+            CFLAGS="-O3 -flto -DNDEBUG -fPIE -fno-strict-aliasing" \
+            LDFLAGS="-pie -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 -Wl,--build-id=sha1"
+
+          "$ANDROID_TOOLCHAIN/llvm-strip" --strip-debug dist/stash-android-arm64-neon
+
+      - name: Validate standard ARM64 NEON binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$GITHUB_WORKSPACE/dist/stash-android-arm64-neon"
+          "$ANDROID_TOOLCHAIN/llvm-readelf" -h "$BIN" | grep -q 'Machine:.*AArch64'
+          "$ANDROID_TOOLCHAIN/llvm-readelf" -lW "$BIN" | grep -q '/system/bin/linker64'
+          file "$BIN" | grep -q 'ELF 64-bit.*ARM aarch64'
+
+          LOAD_ALIGN="$("$ANDROID_TOOLCHAIN/llvm-readelf" -lW "$BIN" | awk '$1 == "LOAD" { print $NF }' | sort -V | tail -n 1)"
+          test "$LOAD_ALIGN" = "0x4000" || {
+            echo "Expected 16 KiB PT_LOAD alignment, found '$LOAD_ALIGN'." >&2
+            exit 1
+          }
+
+          if "$ANDROID_TOOLCHAIN/llvm-readelf" -d "$BIN" 2>/dev/null | grep -q 'libc++_shared\.so'; then
+            echo "Unexpected libc++_shared.so dependency." >&2
+            exit 1
+          fi
+          SYMBOLS="$("$ANDROID_TOOLCHAIN/llvm-readelf" --symbols "$BIN")"
+          grep -q 'UND.*posix_memalign' <<< "$SYMBOLS"
+          if grep -Eq 'UND.*[[:space:]]aligned_alloc$' <<< "$SYMBOLS"; then
+            echo "API 28 aligned_alloc reference found in the API 24 binary." >&2
+            exit 1
+          fi
+
+          DISASSEMBLY="$("$ANDROID_TOOLCHAIN/llvm-objdump" -d --no-show-raw-insn "$BIN")"
+          grep -Eq '[[:space:]]cnt[[:space:]]' <<< "$DISASSEMBLY"
+          grep -Eq '[[:space:]]addv[[:space:]]' <<< "$DISASSEMBLY"
+          strings "$BIN" | grep -F "Stash v37.31-${UCI_DATE}-${SOURCE_SHA}-android-arm64-neon" >/dev/null
+
+      - name: Upload standard ARM64 NEON engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: Stash-Android-ARM64-NEON
+          path: dist/stash-android-arm64-neon
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Build ARM64 DotProd-enabled variant
+        id: build_dotprod
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C src clean
+
+          ENGINE_VERSION="v37.31-${UCI_DATE}-${SOURCE_SHA}-android-arm64-dotprod"
+          make -C src -j2 all \
+            CC="$ANDROID_CC" \
+            ARCH=arm64-dotprod \
+            NATIVE=no \
+            ANDROID=yes \
+            ENGINE_VERSION="$ENGINE_VERSION" \
+            EXE="$GITHUB_WORKSPACE/dist/stash-android-arm64-dotprod" \
+            CFLAGS="-O3 -flto -DNDEBUG -fPIE -fno-strict-aliasing" \
+            LDFLAGS="-pie -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 -Wl,--build-id=sha1"
+
+          "$ANDROID_TOOLCHAIN/llvm-strip" --strip-debug dist/stash-android-arm64-dotprod
+
+      - name: Validate ARM64 DotProd-enabled binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$GITHUB_WORKSPACE/dist/stash-android-arm64-dotprod"
+          "$ANDROID_TOOLCHAIN/llvm-readelf" -h "$BIN" | grep -q 'Machine:.*AArch64'
+          "$ANDROID_TOOLCHAIN/llvm-readelf" -lW "$BIN" | grep -q '/system/bin/linker64'
+          file "$BIN" | grep -q 'ELF 64-bit.*ARM aarch64'
+
+          LOAD_ALIGN="$("$ANDROID_TOOLCHAIN/llvm-readelf" -lW "$BIN" | awk '$1 == "LOAD" { print $NF }' | sort -V | tail -n 1)"
+          test "$LOAD_ALIGN" = "0x4000" || {
+            echo "Expected 16 KiB PT_LOAD alignment, found '$LOAD_ALIGN'." >&2
+            exit 1
+          }
+
+          if "$ANDROID_TOOLCHAIN/llvm-readelf" -d "$BIN" 2>/dev/null | grep -q 'libc++_shared\.so'; then
+            echo "Unexpected libc++_shared.so dependency." >&2
+            exit 1
+          fi
+          SYMBOLS="$("$ANDROID_TOOLCHAIN/llvm-readelf" --symbols "$BIN")"
+          grep -q 'UND.*posix_memalign' <<< "$SYMBOLS"
+          if grep -Eq 'UND.*[[:space:]]aligned_alloc$' <<< "$SYMBOLS"; then
+            echo "API 28 aligned_alloc reference found in the API 24 binary." >&2
+            exit 1
+          fi
+
+          DISASSEMBLY="$("$ANDROID_TOOLCHAIN/llvm-objdump" -d --no-show-raw-insn "$BIN")"
+          grep -Eq '[[:space:]]cnt[[:space:]]' <<< "$DISASSEMBLY"
+          grep -Eq '[[:space:]]addv[[:space:]]' <<< "$DISASSEMBLY"
+          strings "$BIN" | grep -F "Stash v37.31-${UCI_DATE}-${SOURCE_SHA}-android-arm64-dotprod" >/dev/null
+
+      - name: Upload ARM64 DotProd-enabled engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: Stash-Android-ARM64-DotProd
+          path: dist/stash-android-arm64-dotprod
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Write Android build metadata
+        if: always() && steps.build_meta.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cat > dist/ANDROID-BUILD-INFO.txt <<EOF_INFO
+          Engine: Stash
+          Base UCI version: v37.31
+          UCI date: ${UCI_DATE}
+          Source commit: ${SOURCE_SHA}
+          Android NDK: r27c (${NDK_REVISION})
+          Android API: 24
+          ABI: arm64-v8a (AArch64)
+          Tuning target: cortex-a76
+          Baseline variant: arm64-neon (-march=armv8-a+simd)
+          DotProd variant: arm64-dotprod (-march=armv8.2-a+dotprod)
+          NEON implementation: 64-bit bitboard popcount via CNT + ADDV
+          Android aligned allocation: posix_memalign (API 24 compatible; avoids aligned_alloc API 28)
+          DotProd note: the ISA extension is enabled; current Stash code has no integer dot-product kernel and is not expected to emit SDOT
+          Linker: /system/bin/linker64
+          PIE: enabled
+          ELF PT_LOAD alignment: 16 KiB
+          Runtime status: cross-compiled and statically inspected; Android-device execution is not performed by this workflow
+          EOF_INFO
+
+          cat dist/ANDROID-BUILD-INFO.txt
+
+      - name: Upload build metadata
+        if: always() && steps.build_meta.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Stash-Android-Build-Metadata
+          path: dist/ANDROID-BUILD-INFO.txt
+          if-no-files-found: warn
+          retention-days: 30
