@@ -60,6 +60,13 @@ typedef size_t usize;
 typedef float f32;
 typedef double f64;
 
+// AArch64 always provides Advanced SIMD (NEON). Keep the implementation in
+// its own architecture path and retain compiler built-ins for other targets.
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include "arch/arm/neon.h"
+#define STASH_HAS_ARM_NEON 1
+#endif
+
 #ifdef __SIZEOF_INT128__
 #define HAS_INT128
 typedef __int128 i128;
@@ -229,7 +236,11 @@ INLINED usize usize_div_ceil(usize value, usize divisor) {
 // bitmanip API
 
 INLINED u32 u64_count_ones(u64 value) {
+#ifdef STASH_HAS_ARM_NEON
+    return arm_neon_u64_count_ones(value);
+#else
     return (u32)__builtin_popcountll(value);
+#endif
 }
 
 INLINED u32 u64_count_zeros(u64 value) {
