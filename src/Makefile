@@ -23,6 +23,8 @@ DEPENDS := $(SOURCES:%.c=%.d)
 
 ARCH ?=
 NATIVE ?= no
+ANDROID ?= no
+ENGINE_VERSION ?= v37.31
 CFLAGS ?= -O3 -flto -DNDEBUG
 CPPFLAGS ?= -Werror
 LDFLAGS ?=
@@ -32,8 +34,13 @@ user_CPPFLAGS := $(CPPFLAGS)
 user_LDFLAGS := $(LDFLAGS)
 
 own_CFLAGS := -std=gnu11
-own_CPPFLAGS := -Wall -Wextra -Wcast-qual -Wshadow -Wvla -MMD -I include
+own_CPPFLAGS := -Wall -Wextra -Wcast-qual -Wshadow -Wvla -MMD -I include -DSTASH_UCI_VERSION='"$(ENGINE_VERSION)"'
 own_LDFLAGS := -lpthread -lm
+
+# Android's pthread API is provided by bionic's libc, not a separate library.
+ifeq ($(ANDROID),yes)
+    own_LDFLAGS := -lm
+endif
 
 # If no arch is specified, we try to autodetect the target architecture if the
 # compiler allows us to do so.
@@ -64,7 +71,7 @@ ifeq ($(ARCH),)
 		arch:=generic
 	endif
 else
-	maybe_arch:=$(filter x86-64-bmi2 x86-64-popcnt x86-64-modern x86-64 generic,$(firstword $(ARCH)))
+	maybe_arch:=$(filter arm64-dotprod arm64-neon x86-64-bmi2 x86-64-popcnt x86-64-modern x86-64 generic,$(firstword $(ARCH)))
 
 	ifneq ($(maybe_arch),)
 		arch:=$(maybe_arch)
@@ -88,6 +95,19 @@ else
 endif
 
 # Enable use of PREFETCH instruction
+
+# AArch64 targets. arm64-neon is compatible with ARMv8-A devices; the
+# dotprod variant additionally enables the ARMv8.2-A integer dot-product ISA.
+# Stash currently has no integer dot-product kernel, so both variants use the
+# same NEON bitboard-popcount implementation; the second is an ISA-enabled
+# build, not a claim that SDOT is emitted or used by the current engine.
+ifeq ($(arch),arm64-neon)
+    own_CFLAGS += -march=armv8-a+simd -mtune=cortex-a76
+endif
+
+ifeq ($(arch),arm64-dotprod)
+    own_CFLAGS += -march=armv8.2-a+dotprod -mtune=cortex-a76
+endif
 
 ifeq ($(arch),x86-64)
     ifneq ($(NATIVE),yes)
