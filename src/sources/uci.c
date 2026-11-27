@@ -25,7 +25,9 @@
 #include "wdl.h"
 #include "wmalloc.h"
 
-#define UCI_VERSION "v37.31"
+#ifndef STASH_UCI_VERSION
+#define STASH_UCI_VERSION "v37.31"
+#endif
 
 static const Command UciCommands[] = {
     {STATIC_STRVIEW("bench"), uci_bench},
@@ -375,7 +377,7 @@ void uci_t(Uci *uci, __attribute__((unused)) StringView args) {
 }
 
 void uci_uci(Uci *uci, __attribute__((unused)) StringView args) {
-    puts("id name Stash " UCI_VERSION);
+    puts("id name Stash " STASH_UCI_VERSION);
     puts("id author Morgan Houppin et al. (see AUTHORS file)");
     optlist_show_options(&uci->option_list);
     puts("uciok");

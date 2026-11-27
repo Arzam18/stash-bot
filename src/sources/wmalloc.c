@@ -84,6 +84,13 @@ void *
 
 #if defined(_WIN32) || defined(_WIN64)
     void *ptr = _aligned_malloc(size, alignment);
+#elif defined(__ANDROID__)
+    // Bionic added aligned_alloc() in API 28. Keep the Android API 24 build
+    // compatible by using posix_memalign(), which is available from API 16.
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, alignment, size) != 0) {
+        ptr = NULL;
+    }
 #else
     void *ptr = aligned_alloc(alignment, size);
 #endif
